@@ -813,10 +813,35 @@ class PlanningSwarm:
         spinner.stop("Findings resolved")
 
         revised_tree = ComponentTree(**result["revised_tree"])
-        revised_contracts = [
-            InterfaceContract(**c) for c in result["revised_contracts"]
-        ]
-        resolutions = [Resolution(**r) for r in result["resolutions"]]
+
+        # Tolerate incomplete contracts from truncated JSON repair
+        revised_contracts = []
+        for c in result.get("revised_contracts", []):
+            try:
+                revised_contracts.append(InterfaceContract(**c))
+            except Exception as e:
+                bid = c.get("boundary_id", "unknown")
+                print(
+                    f"   (!) Skipping contract '{bid}' — "
+                    f"incomplete from truncated output: {e}"
+                )
+
+        # Fall back to pre-adversary contracts for any that were dropped
+        if revised_contracts and len(revised_contracts) < len(contracts):
+            existing_ids = {c.boundary_id for c in revised_contracts}
+            for c in contracts:
+                if c.boundary_id not in existing_ids:
+                    revised_contracts.append(c)
+                    print(
+                        f"   (!) Kept original contract '{c.boundary_id}'"
+                    )
+
+        resolutions = []
+        for r in result.get("resolutions", []):
+            try:
+                resolutions.append(Resolution(**r))
+            except Exception:
+                pass  # skip incomplete resolutions
 
         # Save updated artifacts
         save_artifact(

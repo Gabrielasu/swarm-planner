@@ -135,6 +135,7 @@ Or configure during `swarm init`.
 
 ## Cost
 
+You can use your Claude subscription through Opencode to run the tool. Alternatively, use the Anthropic API.
 A typical run for a medium-complexity project (20-40 tasks) costs **$12-35** across 10-20 LLM calls. The Interviewer step adds negligible cost ($0.10-0.30) but significantly improves output quality for vague inputs.
 
 ## Design
