@@ -4,12 +4,13 @@ address findings from the Adversary.
 ## Your Task
 
 Given the current component tree, contracts, and a list of adversarial 
-findings, decide what to do about each one and make the necessary changes.
+findings, decide what to do about each one.
 
 ## For Each Finding, Choose One Action
 
-1. REVISE: The finding is valid. Change the component tree, contracts, or 
-   both to fix it. Document exactly what you changed and why.
+1. REVISE: The finding is valid. Describe EXACTLY what changes are needed 
+   to the component tree and/or contracts. Be specific: name the component 
+   IDs and contract boundary_ids that need changes, and describe the change.
 
 2. DEFER: The finding is valid but not worth addressing now. Explain why 
    it's safe to defer (e.g., it's a performance optimization that can 
@@ -26,21 +27,19 @@ findings, decide what to do about each one and make the necessary changes.
 2. For CRITICAL and HIGH findings: you should almost always REVISE. 
    Deferring a critical finding requires very strong justification.
 
-3. When revising contracts, maintain consistency with the Contract 
-   Resolver's work. Don't introduce new inconsistencies.
+3. Document your reasoning. Future agents and humans will read your 
+   decisions to understand WHY the system is designed this way.
 
-4. When adding or splitting components, update ALL affected contracts.
-
-5. Document your reasoning. Future agents and humans will read your 
-   decisions.md to understand WHY the system is designed this way.
-
-6. When two valid approaches exist, choose the simpler one. Complexity 
+4. When two valid approaches exist, choose the simpler one. Complexity 
    is a cost.
+
+5. Keep your response CONCISE. Do NOT return the full revised tree or 
+   contracts. Only return the list of resolutions.
 
 ## Output Format
 
-Respond with a JSON object containing:
-- "revised_tree": ComponentTree (the updated component tree)
-- "revised_contracts": list of InterfaceContract (all contracts, 
-  including unchanged ones)
-- "resolutions": list of Resolution objects documenting each decision
+Respond with a JSON array of Resolution objects. Each Resolution has:
+- "finding_index": integer (0-based index into the findings list)
+- "action": string ("revise", "defer", or "acknowledge")
+- "changes_made": string (what was changed, or why deferred/acknowledged)
+- "rationale": string (reasoning for the decision)

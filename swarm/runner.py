@@ -786,81 +786,103 @@ class PlanningSwarm:
         contracts: list[InterfaceContract],
         findings: list[Finding],
     ) -> tuple[ComponentTree, list[InterfaceContract], list[Resolution]]:
-        """Address each finding from the Adversary."""
-        spinner = ProgressSpinner(
-            "Adversary Resolver", "addressing findings"
-        )
-        spinner.start()
-        try:
-            context = assemble_context(
-                prompt_file="prompts/05_adversary_resolver.md",
-                variables={
-                    "component_tree": tree.model_dump_json(indent=2),
-                    "contracts": json.dumps(
-                        [c.model_dump() for c in contracts], indent=2
-                    ),
-                    "findings": json.dumps(
-                        [f.model_dump() for f in findings], indent=2
-                    ),
-                },
-            )
-            result = call_model(
-                context, tier=ModelTier.FRONTIER, response_format=dict
-            )
-        except Exception:
-            spinner.stop("failed")
-            raise
-        spinner.stop("Findings resolved")
+        """Address findings from the Adversary in small batches.
 
-        revised_tree = ComponentTree(**result["revised_tree"])
+        Processes findings in groups of BATCH_SIZE, checkpointing after
+        each batch so progress isn't lost on failure.
+        """
+        BATCH_SIZE = 5
+        all_resolutions: list[Resolution] = []
 
-        # Tolerate incomplete contracts from truncated JSON repair
-        revised_contracts = []
-        for c in result.get("revised_contracts", []):
+        # Resume from previously completed findings if any
+        adv_state = self.state.data.get("adversary_resolutions", [])
+        if adv_state:
+            for r in adv_state:
+                try:
+                    all_resolutions.append(Resolution(**r))
+                except Exception:
+                    pass
+            print(
+                f"   Resuming: {len(all_resolutions)} findings "
+                f"already resolved"
+            )
+
+        remaining = findings[len(all_resolutions):]
+        if not remaining:
+            return tree, contracts, all_resolutions
+
+        # Process in batches
+        batches = [
+            remaining[i : i + BATCH_SIZE]
+            for i in range(0, len(remaining), BATCH_SIZE)
+        ]
+        total_findings = len(findings)
+        done_so_far = len(all_resolutions)
+
+        for batch_idx, batch in enumerate(batches):
+            start_idx = done_so_far
+            end_idx = done_so_far + len(batch)
+            spinner = ProgressSpinner(
+                "Adversary Resolver",
+                f"findings {start_idx + 1}-{end_idx}/{total_findings}",
+            )
+            spinner.start()
             try:
-                revised_contracts.append(InterfaceContract(**c))
-            except Exception as e:
-                bid = c.get("boundary_id", "unknown")
-                print(
-                    f"   (!) Skipping contract '{bid}' — "
-                    f"incomplete from truncated output: {e}"
+                context = assemble_context(
+                    prompt_file="prompts/05_adversary_resolver.md",
+                    variables={
+                        "component_tree": tree.model_dump_json(indent=2),
+                        "contracts": json.dumps(
+                            [c.model_dump() for c in contracts], indent=2
+                        ),
+                        "findings": json.dumps(
+                            [f.model_dump() for f in batch], indent=2
+                        ),
+                    },
                 )
-
-        # Fall back to pre-adversary contracts for any that were dropped
-        if revised_contracts and len(revised_contracts) < len(contracts):
-            existing_ids = {c.boundary_id for c in revised_contracts}
-            for c in contracts:
-                if c.boundary_id not in existing_ids:
-                    revised_contracts.append(c)
-                    print(
-                        f"   (!) Kept original contract '{c.boundary_id}'"
-                    )
-
-        resolutions = []
-        for r in result.get("resolutions", []):
-            try:
-                resolutions.append(Resolution(**r))
+                result = call_model(
+                    context,
+                    tier=ModelTier.FRONTIER,
+                    response_format=list[Resolution],
+                )
             except Exception:
-                pass  # skip incomplete resolutions
+                spinner.stop("failed")
+                raise
 
-        # Save updated artifacts
-        save_artifact(
-            self.plan_dir / "architecture.md",
-            self._render_architecture(revised_tree),
-        )
-        for contract in revised_contracts:
-            save_artifact(
-                self.plan_dir
-                / "contracts"
-                / f"{contract.boundary_id}.md",
-                self._render_contract(contract),
+            batch_resolutions = (
+                result if isinstance(result, list) else []
             )
+            revised = sum(
+                1 for r in batch_resolutions if r.action == "revise"
+            )
+            spinner.stop(f"{len(batch_resolutions)} done ({revised} revisions)")
+
+            all_resolutions.extend(batch_resolutions)
+            done_so_far += len(batch)
+
+            # Checkpoint after each batch
+            self.state.data["adversary_resolutions"] = [
+                r.model_dump() for r in all_resolutions
+            ]
+            self.state.save()
+
+        # Save final decisions document
         save_artifact(
             self.plan_dir / "decisions.md",
-            self._render_decisions(resolutions),
+            self._render_decisions(all_resolutions),
         )
 
-        return revised_tree, revised_contracts, resolutions
+        total_revised = sum(
+            1 for r in all_resolutions if r.action == "revise"
+        )
+        print(
+            f"   All {len(all_resolutions)} findings resolved "
+            f"({total_revised} revisions)"
+        )
+
+        # Tree and contracts pass through — the Contract Resolver
+        # re-run in the adversary loop will refine them.
+        return tree, contracts, all_resolutions
 
     # -- Step 6: Sequence into Tasks ------------------------------------------
 
@@ -1139,6 +1161,8 @@ class PlanningSwarm:
                 )
                 contracts = self.resolve_contracts(tree, contracts)
                 self.state.data["adversary_round"] = i + 1
+                # Clear batch checkpoints for next round
+                self.state.data.pop("adversary_resolutions", None)
                 self.state.save()  # checkpoint within the loop
 
             self.state.mark_complete(
