@@ -56,4 +56,5 @@ For each task, assign one of:
 
 ## Output Format
 
-Respond with a JSON array of TaskVerdict objects matching the schema provided.
+Respond with a JSON array of TaskVerdict objects matching the schema provided. 
+You may receive a subset of tasks; evaluate only the tasks provided.

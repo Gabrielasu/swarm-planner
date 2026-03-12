@@ -711,40 +711,55 @@ class PlanningSwarm:
         tree: ComponentTree,
         contracts: list[InterfaceContract],
     ) -> list[InterfaceContract]:
-        """Make contracts implementation-grade."""
-        spinner = ProgressSpinner(
-            "Contract Resolver", "resolving contracts"
-        )
-        spinner.start()
-        try:
-            context = assemble_context(
-                prompt_file="prompts/03_contract_resolver.md",
-                variables={
-                    "component_tree": tree.model_dump_json(indent=2),
-                    "contracts": json.dumps(
-                        [c.model_dump() for c in contracts], indent=2
-                    ),
-                },
+        """Make contracts implementation-grade, processing in batches."""
+        BATCH_SIZE = 3
+        resolved: list[InterfaceContract] = []
+
+        batches = [
+            contracts[i : i + BATCH_SIZE]
+            for i in range(0, len(contracts), BATCH_SIZE)
+        ]
+        total = len(contracts)
+
+        for batch_idx, batch in enumerate(batches):
+            start = batch_idx * BATCH_SIZE + 1
+            end = min(start + BATCH_SIZE - 1, total)
+            spinner = ProgressSpinner(
+                "Contract Resolver",
+                f"contracts {start}-{end}/{total}",
             )
-            result = call_model(
-                context,
-                tier=ModelTier.CODING,
-                response_format=list[InterfaceContract],
-            )
-        except Exception:
-            spinner.stop("failed")
-            raise
-        spinner.stop(f"{len(result)} contracts resolved")
+            spinner.start()
+            try:
+                context = assemble_context(
+                    prompt_file="prompts/03_contract_resolver.md",
+                    variables={
+                        "component_tree": tree.model_dump_json(indent=2),
+                        "contracts": json.dumps(
+                            [c.model_dump() for c in batch], indent=2
+                        ),
+                    },
+                )
+                result = call_model(
+                    context,
+                    tier=ModelTier.CODING,
+                    response_format=list[InterfaceContract],
+                )
+            except Exception:
+                spinner.stop("failed")
+                raise
+            spinner.stop(f"{len(result)} resolved")
+            resolved.extend(result)
 
         # Overwrite drafts with resolved versions
-        for contract in result:
+        for contract in resolved:
             save_artifact(
                 self.plan_dir
                 / "contracts"
                 / f"{contract.boundary_id}.md",
                 self._render_contract(contract),
             )
-        return result
+        print(f"   All {len(resolved)}/{total} contracts resolved")
+        return resolved
 
     # -- Step 4: Adversarial Review -------------------------------------------
 
@@ -930,38 +945,61 @@ class PlanningSwarm:
         contracts: list[InterfaceContract],
         tasks: list[Task],
     ) -> list[TaskVerdict]:
-        """Check if each task can be one-shotted."""
-        spinner = ProgressSpinner("Simulator", "checking readiness")
-        spinner.start()
-        try:
-            context = assemble_context(
-                prompt_file="prompts/07_simulator.md",
-                variables={
-                    "component_tree": tree.model_dump_json(indent=2),
-                    "contracts": json.dumps(
-                        [c.model_dump() for c in contracts], indent=2
-                    ),
-                    "tasks": json.dumps(
-                        [t.model_dump() for t in tasks], indent=2
-                    ),
-                },
+        """Check if each task can be one-shotted, in batches."""
+        BATCH_SIZE = 5
+        all_verdicts: list[TaskVerdict] = []
+
+        batches = [
+            tasks[i : i + BATCH_SIZE]
+            for i in range(0, len(tasks), BATCH_SIZE)
+        ]
+        total = len(tasks)
+
+        for batch_idx, batch in enumerate(batches):
+            start = batch_idx * BATCH_SIZE + 1
+            end = min(start + BATCH_SIZE - 1, total)
+            spinner = ProgressSpinner(
+                "Simulator",
+                f"tasks {start}-{end}/{total}",
             )
-            result = call_model(
-                context,
-                tier=ModelTier.FRONTIER,
-                response_format=list[TaskVerdict],
+            spinner.start()
+            try:
+                context = assemble_context(
+                    prompt_file="prompts/07_simulator.md",
+                    variables={
+                        "component_tree": tree.model_dump_json(indent=2),
+                        "contracts": json.dumps(
+                            [c.model_dump() for c in contracts], indent=2
+                        ),
+                        "tasks": json.dumps(
+                            [t.model_dump() for t in batch], indent=2
+                        ),
+                    },
+                )
+                result = call_model(
+                    context,
+                    tier=ModelTier.FRONTIER,
+                    response_format=list[TaskVerdict],
+                )
+            except Exception:
+                spinner.stop("failed")
+                raise
+            batch_ready = sum(
+                1 for v in result if v.readiness == Readiness.READY
             )
-        except Exception:
-            spinner.stop("failed")
-            raise
-        ready = sum(1 for v in result if v.readiness == Readiness.READY)
-        spinner.stop(f"{ready}/{len(result)} tasks ready")
+            spinner.stop(f"{batch_ready}/{len(result)} ready")
+            all_verdicts.extend(result)
+
+        ready = sum(
+            1 for v in all_verdicts if v.readiness == Readiness.READY
+        )
+        print(f"   All {ready}/{total} tasks ready")
 
         save_artifact(
             self.plan_dir / "simulation-report.md",
-            self._render_simulation(result),
+            self._render_simulation(all_verdicts),
         )
-        return result
+        return all_verdicts
 
     # -- Serialization helpers ------------------------------------------------
 
@@ -1139,26 +1177,61 @@ class PlanningSwarm:
             for i in range(
                 self.state.data.get("adversary_round", 0), max_rounds
             ):
-                print(f"\n   Round {i + 1}/{max_rounds}")
+                print(f"\n   {'=' * 40}")
+                print(f"   ADVERSARY ROUND {i + 1}/{max_rounds}")
+                print(f"   {'=' * 40}")
+                print(f"   Components: {len(tree.components)}")
+                print(f"   Contracts: {len(contracts)}")
+
                 findings = self.run_adversary(tree, contracts)
+
+                # Categorize findings by severity
+                by_severity = {}
+                for f in findings:
+                    by_severity.setdefault(f.severity.value, []).append(f)
                 critical = [
                     f
                     for f in findings
                     if f.severity in (Severity.CRITICAL, Severity.HIGH)
                 ]
+
+                print(f"\n   Findings breakdown:")
+                for sev in ["critical", "high", "moderate", "low"]:
+                    count = len(by_severity.get(sev, []))
+                    if count:
+                        print(f"     {sev.upper()}: {count}")
                 print(
-                    f"   -> {len(findings)} findings "
-                    f"({len(critical)} critical/high)"
+                    f"   Total: {len(findings)} "
+                    f"({len(critical)} need resolution)"
                 )
+
                 rounds_completed = i + 1
 
                 if not critical:
-                    print("   > Plan is stable.")
+                    print(f"\n   Plan is stable — no critical/high findings.")
                     break
 
-                tree, contracts, _ = self.resolve_adversary(
+                print(f"\n   Resolving {len(findings)} findings...")
+                tree, contracts, resolutions = self.resolve_adversary(
                     tree, contracts, findings
                 )
+
+                # Show resolution summary
+                revised = sum(
+                    1 for r in resolutions if r.action == "revise"
+                )
+                deferred = sum(
+                    1 for r in resolutions if r.action == "defer"
+                )
+                acked = sum(
+                    1 for r in resolutions if r.action == "acknowledge"
+                )
+                print(
+                    f"   Resolutions: {revised} revised, "
+                    f"{deferred} deferred, {acked} acknowledged"
+                )
+
+                print(f"\n   Re-resolving contracts after revisions...")
                 contracts = self.resolve_contracts(tree, contracts)
                 self.state.data["adversary_round"] = i + 1
                 # Clear batch checkpoints for next round
