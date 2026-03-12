@@ -50,4 +50,5 @@ Given a component tree and a set of draft interface contracts, check and fix:
 ## Output Format
 
 Respond with a JSON array of InterfaceContract objects matching the schema 
-provided. Return ALL contracts (not just changed ones).
+provided. Return ALL contracts in the input (not just changed ones). You may 
+receive a subset of the system's contracts; resolve only those provided.
