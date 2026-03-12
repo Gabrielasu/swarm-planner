@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "planning-swarm"
+version = "0.1.0"
+description = "Multi-agent planning orchestrator that produces implementation-ready specifications"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "click>=8.1",
+    "pydantic>=2.0",
+    "anthropic>=0.39",
+]
+
+[project.scripts]
+swarm = "swarm.cli:cli"
+
+[tool.setuptools.packages.find]
+include = ["swarm*"]
+
+[tool.setuptools.package-data]
+swarm = ["prompts/*.md"]

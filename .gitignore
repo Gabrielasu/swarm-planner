@@ -1,0 +1,35 @@
+# Planning artifacts (until exported)
+.plan/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets and environment — NEVER commit API keys
+.env
+.env.*
+*.key
+*.secret
+config.toml
+secrets.toml
