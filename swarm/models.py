@@ -7,8 +7,10 @@ Supports two backends:
 
 import json
 import os
+import re
 import subprocess
 import sys
+import time
 from enum import Enum
 
 from pydantic import BaseModel
@@ -22,12 +24,36 @@ class ModelTier(str, Enum):
     FAST = "fast"  # Haiku — compression, summaries
 
 
+class ModelTimeoutError(Exception):
+    """Raised when a model call times out. Callers can catch and retry."""
+
+    def __init__(self, tier: ModelTier, timeout: int, message: str = ""):
+        self.tier = tier
+        self.timeout = timeout
+        super().__init__(
+            message
+            or f"Model call ({tier.value}) timed out after {timeout}s"
+        )
+
+
+class ModelCallError(Exception):
+    """Raised when a model call fails (non-timeout). Callers can retry."""
+
+    def __init__(self, message: str, returncode: int = -1):
+        self.returncode = returncode
+        super().__init__(message)
+
+
 # Timeouts per tier (seconds)
 TIER_TIMEOUTS = {
     ModelTier.FRONTIER: 900,  # 15 minutes — Opus is slow but thorough
     ModelTier.CODING: 600,    # 10 minutes — Sonnet with large payloads
     ModelTier.FAST: 300,      # 5 minutes — Haiku/fast tasks
 }
+
+# Retry configuration
+MAX_RETRIES = 2          # retry up to 2 times (3 attempts total)
+RETRY_BACKOFF_BASE = 10  # seconds between retries
 
 
 def _get_model_map() -> dict:
@@ -43,20 +69,57 @@ def _get_model_map() -> dict:
 def call_model(
     context: dict, tier: ModelTier, response_format=None
 ) -> str | dict | list | BaseModel:
-    """Call the appropriate model for this tier.
+    """Call the appropriate model for this tier, with automatic retry.
 
     Routes to either the Anthropic API or OpenCode based on config.
+    Retries on timeout or transient errors with exponential backoff.
     """
     cfg = load_config()
+    last_error: Exception | None = None
 
-    if cfg["auth_method"] == "opencode":
-        text = _call_via_opencode(context, tier, response_format)
-    else:
-        text = _call_via_api(context, tier, response_format, cfg["api_key"])
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            if cfg["auth_method"] == "opencode":
+                text = _call_via_opencode(context, tier, response_format)
+            else:
+                text = _call_via_api(
+                    context, tier, response_format, cfg["api_key"]
+                )
 
-    if response_format:
-        return _parse_structured(text, response_format)
-    return text
+            if response_format:
+                return _parse_structured(text, response_format)
+            return text
+
+        except ModelTimeoutError as e:
+            last_error = e
+            if attempt < MAX_RETRIES:
+                wait = RETRY_BACKOFF_BASE * (attempt + 1)
+                print(
+                    f"\n   (!) Timeout on attempt {attempt + 1}/{MAX_RETRIES + 1}. "
+                    f"Retrying in {wait}s...",
+                    file=sys.stderr,
+                )
+                time.sleep(wait)
+            else:
+                raise
+
+        except ModelCallError as e:
+            last_error = e
+            if attempt < MAX_RETRIES:
+                wait = RETRY_BACKOFF_BASE * (attempt + 1)
+                print(
+                    f"\n   (!) Error on attempt {attempt + 1}/{MAX_RETRIES + 1}: "
+                    f"{e}. Retrying in {wait}s...",
+                    file=sys.stderr,
+                )
+                time.sleep(wait)
+            else:
+                raise
+
+    # Should not reach here, but just in case
+    if last_error is not None:
+        raise last_error
+    raise ModelCallError("All retry attempts exhausted")
 
 
 # -- Anthropic API backend ----------------------------------------------------
@@ -139,11 +202,11 @@ def _call_via_opencode(
             timeout=timeout,
         )
     except subprocess.TimeoutExpired:
-        print(
-            f"\n  Error: OpenCode call timed out after {timeout}s.",
-            file=sys.stderr,
+        raise ModelTimeoutError(
+            tier=tier,
+            timeout=timeout,
+            message=f"OpenCode call timed out after {timeout}s",
         )
-        sys.exit(1)
     except FileNotFoundError:
         print(
             "\n  Error: 'opencode' not found. Is it installed?",
@@ -154,13 +217,11 @@ def _call_via_opencode(
 
     if result.returncode != 0:
         stderr = result.stderr.strip()
-        print(
-            f"\n  Error: OpenCode returned exit code {result.returncode}",
-            file=sys.stderr,
+        raise ModelCallError(
+            f"OpenCode returned exit code {result.returncode}"
+            + (f": {stderr[:500]}" if stderr else ""),
+            returncode=result.returncode,
         )
-        if stderr:
-            print(f"  {stderr[:500]}", file=sys.stderr)
-        sys.exit(1)
 
     # Parse JSON-lines output, extract only text parts
     return _parse_opencode_json_output(result.stdout)
@@ -244,11 +305,21 @@ def _extract_json_string(text: str) -> str:
             json.loads(cleaned)
             return cleaned
         except json.JSONDecodeError:
-            pass
+            # Try sanitizing before moving on
+            try:
+                sanitized = _sanitize_json(cleaned)
+                json.loads(sanitized)
+                print(
+                    "   (i) JSON had minor issues (trailing commas / "
+                    "control chars), auto-repaired.",
+                    file=sys.stderr,
+                )
+                return sanitized
+            except json.JSONDecodeError:
+                pass
 
     # Strategy 2: strip markdown fences
     # Handle ```json\n...\n``` or ```\n...\n```
-    import re
     fence_match = re.search(
         r"```(?:json|JSON)?\s*\n(.*?)```", cleaned, re.DOTALL
     )
@@ -258,7 +329,16 @@ def _extract_json_string(text: str) -> str:
             json.loads(candidate)
             return candidate
         except json.JSONDecodeError:
-            pass
+            try:
+                sanitized = _sanitize_json(candidate)
+                json.loads(sanitized)
+                print(
+                    "   (i) JSON had minor issues, auto-repaired.",
+                    file=sys.stderr,
+                )
+                return sanitized
+            except json.JSONDecodeError:
+                pass
 
     # Strategy 3: find outermost brackets
     # Look for first { or [ and matching last } or ]
@@ -315,9 +395,21 @@ def _extract_json_string(text: str) -> str:
         return candidate
 
     candidate = cleaned[start : end + 1]
-    # Final validation
-    json.loads(candidate)  # raises JSONDecodeError if still invalid
-    return candidate
+    # Final validation — try raw first, then sanitized
+    try:
+        json.loads(candidate)
+        return candidate
+    except json.JSONDecodeError:
+        sanitized = _sanitize_json(candidate)
+        try:
+            json.loads(sanitized)
+            print(
+                "   (i) JSON had minor issues, auto-repaired.",
+                file=sys.stderr,
+            )
+            return sanitized
+        except json.JSONDecodeError:
+            raise  # propagate the error from sanitized attempt
 
 
 def _repair_truncated_json(text: str) -> str:
@@ -327,8 +419,6 @@ def _repair_truncated_json(text: str) -> str:
     trims to the last cleanly-closed value, then closes all
     remaining open brackets.
     """
-    import re
-
     # Walk the text, track bracket stack and string state
     stack = []       # stack of closing chars needed: } or ]
     in_string = False
@@ -428,32 +518,93 @@ def _repair_truncated_json(text: str) -> str:
     return repaired
 
 
+def _sanitize_json(text: str) -> str:
+    """Fix common JSON issues in LLM output.
+
+    Handles:
+      - Trailing commas before } or ]
+      - Literal control characters inside string values (newlines, tabs, etc.)
+    """
+    # 1. Remove trailing commas before closing brackets
+    text = re.sub(r",(\s*[}\]])", r"\1", text)
+
+    # 2. Fix literal control characters inside JSON string values.
+    #    JSON spec requires control chars (U+0000–U+001F) to be escaped.
+    #    LLMs often emit literal newlines/tabs inside string values.
+    def _fix_control_chars(match: re.Match) -> str:
+        s = match.group(0)
+        parts: list[str] = []
+        i = 0
+        while i < len(s):
+            c = s[i]
+            # Preserve already-escaped sequences
+            if c == "\\" and i + 1 < len(s):
+                parts.append(s[i : i + 2])
+                i += 2
+                continue
+            code = ord(c)
+            if code < 0x20:
+                if c == "\n":
+                    parts.append("\\n")
+                elif c == "\r":
+                    parts.append("\\r")
+                elif c == "\t":
+                    parts.append("\\t")
+                else:
+                    parts.append(f"\\u{code:04x}")
+            else:
+                parts.append(c)
+            i += 1
+        return "".join(parts)
+
+    # Match JSON string literals (handles escaped quotes inside)
+    text = re.sub(
+        r'"(?:[^"\\]|\\.)*"', _fix_control_chars, text, flags=re.DOTALL
+    )
+
+    return text
+
+
 def _parse_structured(text: str, response_format):
-    """Parse model response into structured format."""
+    """Parse model response into structured format.
+
+    Raises ModelCallError on parse failure so the retry loop can retry.
+    """
     try:
         cleaned = _extract_json_string(text)
-    except json.JSONDecodeError:
-        # Show useful diagnostic on failure
+    except json.JSONDecodeError as je:
+        # Show useful diagnostic on failure — raise ModelCallError so
+        # the retry loop in call_model() can retry the whole call
         preview = text[:300] if len(text) > 300 else text
         suffix = text[-200:] if len(text) > 500 else ""
-        raise RuntimeError(
+        msg = (
             f"Failed to extract JSON from model output "
             f"({len(text)} chars).\n"
-            f"  Start: {preview!r}\n"
-            f"  End: {suffix!r}" if suffix else
-            f"Failed to extract JSON from model output "
-            f"({len(text)} chars).\n"
-            f"  Content: {preview!r}"
+            f"  Parse error: {je.msg} at pos {je.pos}\n"
+            f"  Start: {preview!r}"
+        )
+        if suffix:
+            msg += f"\n  End: {suffix!r}"
+        raise ModelCallError(msg)
+
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError as e:
+        raise ModelCallError(
+            f"JSON decode failed after extraction ({len(cleaned)} chars): {e}"
         )
 
-    parsed = json.loads(cleaned)
+    try:
+        if hasattr(response_format, "model_validate"):
+            return response_format.model_validate(parsed)
 
-    if hasattr(response_format, "model_validate"):
-        return response_format.model_validate(parsed)
+        if hasattr(response_format, "__origin__"):
+            args = getattr(response_format, "__args__", ())
+            if args and hasattr(args[0], "model_validate") and isinstance(parsed, list):
+                return [args[0].model_validate(item) for item in parsed]
 
-    if hasattr(response_format, "__origin__"):
-        args = getattr(response_format, "__args__", ())
-        if args and hasattr(args[0], "model_validate") and isinstance(parsed, list):
-            return [args[0].model_validate(item) for item in parsed]
-
-    return parsed
+        return parsed
+    except Exception as e:
+        raise ModelCallError(
+            f"Schema validation failed: {e}"
+        )

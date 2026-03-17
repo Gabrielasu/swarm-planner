@@ -711,19 +711,42 @@ class PlanningSwarm:
         tree: ComponentTree,
         contracts: list[InterfaceContract],
     ) -> list[InterfaceContract]:
-        """Make contracts implementation-grade, processing in batches."""
-        BATCH_SIZE = 3
-        resolved: list[InterfaceContract] = []
+        """Make contracts implementation-grade, processing in small batches.
 
-        batches = [
-            contracts[i : i + BATCH_SIZE]
-            for i in range(0, len(contracts), BATCH_SIZE)
-        ]
+        Checkpoints after each batch so progress survives timeouts.
+        Resumes from previously completed batches on retry.
+        """
+        BATCH_SIZE = 3
         total = len(contracts)
 
+        # Resume from previously completed contracts if any
+        cr_state = self.state.data.get("contract_resolutions", [])
+        resolved: list[InterfaceContract] = []
+        if cr_state:
+            for c in cr_state:
+                try:
+                    resolved.append(InterfaceContract(**c))
+                except Exception:
+                    pass
+            if resolved:
+                print(
+                    f"   Resuming: {len(resolved)}/{total} contracts "
+                    f"already resolved"
+                )
+
+        remaining = contracts[len(resolved):]
+        if not remaining:
+            return resolved + []  # all already done
+
+        batches = [
+            remaining[i : i + BATCH_SIZE]
+            for i in range(0, len(remaining), BATCH_SIZE)
+        ]
+        done_so_far = len(resolved)
+
         for batch_idx, batch in enumerate(batches):
-            start = batch_idx * BATCH_SIZE + 1
-            end = min(start + BATCH_SIZE - 1, total)
+            start = done_so_far + 1
+            end = done_so_far + len(batch)
             spinner = ProgressSpinner(
                 "Contract Resolver",
                 f"contracts {start}-{end}/{total}",
@@ -746,9 +769,31 @@ class PlanningSwarm:
                 )
             except Exception:
                 spinner.stop("failed")
+                # Save progress before re-raising
+                if resolved:
+                    self.state.data["contract_resolutions"] = [
+                        c.model_dump() for c in resolved
+                    ]
+                    self.state.save()
+                    print(
+                        f"   Checkpointed {len(resolved)}/{total} "
+                        f"contracts before failure"
+                    )
                 raise
+
             spinner.stop(f"{len(result)} resolved")
             resolved.extend(result)
+            done_so_far += len(batch)
+
+            # Checkpoint after each batch
+            self.state.data["contract_resolutions"] = [
+                c.model_dump() for c in resolved
+            ]
+            self.state.save()
+
+        # Clear checkpoint now that we're fully done
+        self.state.data.pop("contract_resolutions", None)
+        self.state.save()
 
         # Overwrite drafts with resolved versions
         for contract in resolved:
@@ -768,30 +813,95 @@ class PlanningSwarm:
         tree: ComponentTree,
         contracts: list[InterfaceContract],
     ) -> list[Finding]:
-        """Try to break the plan."""
-        spinner = ProgressSpinner("Adversary", "attacking the plan")
-        spinner.start()
-        try:
-            context = assemble_context(
-                prompt_file="prompts/04_adversary.md",
-                variables={
-                    "component_tree": tree.model_dump_json(indent=2),
-                    "contracts": json.dumps(
-                        [c.model_dump() for c in contracts], indent=2
-                    ),
-                },
-            )
-            result = call_model(
-                context,
-                tier=ModelTier.FRONTIER,
-                response_format=list[Finding],
-            )
-        except Exception:
-            spinner.stop("failed")
-            raise
-        spinner.stop(f"{len(result)} findings")
+        """Try to break the plan, processing contracts in chunks.
 
-        return result
+        Instead of sending all contracts at once (which can time out),
+        splits contracts into batches and runs adversary analysis on each.
+        Findings are merged and deduplicated at the end.
+        """
+        BATCH_SIZE = 6
+        total = len(contracts)
+        all_findings: list[Finding] = []
+
+        # Resume from previously completed adversary batches if any
+        adv_findings_state = self.state.data.get("adversary_findings", [])
+        if adv_findings_state:
+            for f in adv_findings_state:
+                try:
+                    all_findings.append(Finding(**f))
+                except Exception:
+                    pass
+            if all_findings:
+                print(
+                    f"   Resuming: {len(all_findings)} findings "
+                    f"from prior batches"
+                )
+
+        batches_done = self.state.data.get("adversary_batches_done", 0)
+        batches = [
+            contracts[i : i + BATCH_SIZE]
+            for i in range(0, total, BATCH_SIZE)
+        ]
+
+        for batch_idx, batch in enumerate(batches):
+            # Skip already-completed batches
+            if batch_idx < batches_done:
+                continue
+
+            start = batch_idx * BATCH_SIZE + 1
+            end = min(start + BATCH_SIZE - 1, total)
+            spinner = ProgressSpinner(
+                "Adversary",
+                f"attacking contracts {start}-{end}/{total}",
+            )
+            spinner.start()
+            try:
+                context = assemble_context(
+                    prompt_file="prompts/04_adversary.md",
+                    variables={
+                        "component_tree": tree.model_dump_json(indent=2),
+                        "contracts": json.dumps(
+                            [c.model_dump() for c in batch], indent=2
+                        ),
+                    },
+                )
+                result = call_model(
+                    context,
+                    tier=ModelTier.FRONTIER,
+                    response_format=list[Finding],
+                )
+            except Exception:
+                spinner.stop("failed")
+                # Save progress before re-raising
+                if all_findings:
+                    self.state.data["adversary_findings"] = [
+                        f.model_dump() for f in all_findings
+                    ]
+                    self.state.data["adversary_batches_done"] = batch_idx
+                    self.state.save()
+                    print(
+                        f"   Checkpointed {len(all_findings)} findings "
+                        f"before failure"
+                    )
+                raise
+
+            spinner.stop(f"{len(result)} findings")
+            all_findings.extend(result)
+
+            # Checkpoint after each batch
+            self.state.data["adversary_findings"] = [
+                f.model_dump() for f in all_findings
+            ]
+            self.state.data["adversary_batches_done"] = batch_idx + 1
+            self.state.save()
+
+        # Clear checkpoint now that we're fully done
+        self.state.data.pop("adversary_findings", None)
+        self.state.data.pop("adversary_batches_done", None)
+        self.state.save()
+
+        print(f"   Total: {len(all_findings)} findings across all batches")
+        return all_findings
 
     # -- Step 5: Resolve Adversary Findings -----------------------------------
 
@@ -862,6 +972,16 @@ class PlanningSwarm:
                 )
             except Exception:
                 spinner.stop("failed")
+                # Save progress before re-raising
+                if all_resolutions:
+                    self.state.data["adversary_resolutions"] = [
+                        r.model_dump() for r in all_resolutions
+                    ]
+                    self.state.save()
+                    print(
+                        f"   Checkpointed {len(all_resolutions)} "
+                        f"resolutions before failure"
+                    )
                 raise
 
             batch_resolutions = (
@@ -945,19 +1065,41 @@ class PlanningSwarm:
         contracts: list[InterfaceContract],
         tasks: list[Task],
     ) -> list[TaskVerdict]:
-        """Check if each task can be one-shotted, in batches."""
-        BATCH_SIZE = 5
-        all_verdicts: list[TaskVerdict] = []
+        """Check if each task can be one-shotted, in batches.
 
-        batches = [
-            tasks[i : i + BATCH_SIZE]
-            for i in range(0, len(tasks), BATCH_SIZE)
-        ]
+        Checkpoints after each batch so progress survives timeouts.
+        """
+        BATCH_SIZE = 5
         total = len(tasks)
 
+        # Resume from previously completed verdicts if any
+        sim_state = self.state.data.get("simulation_verdicts", [])
+        all_verdicts: list[TaskVerdict] = []
+        if sim_state:
+            for v in sim_state:
+                try:
+                    all_verdicts.append(TaskVerdict(**v))
+                except Exception:
+                    pass
+            if all_verdicts:
+                print(
+                    f"   Resuming: {len(all_verdicts)}/{total} tasks "
+                    f"already simulated"
+                )
+
+        remaining = tasks[len(all_verdicts):]
+        if not remaining:
+            return all_verdicts
+
+        batches = [
+            remaining[i : i + BATCH_SIZE]
+            for i in range(0, len(remaining), BATCH_SIZE)
+        ]
+        done_so_far = len(all_verdicts)
+
         for batch_idx, batch in enumerate(batches):
-            start = batch_idx * BATCH_SIZE + 1
-            end = min(start + BATCH_SIZE - 1, total)
+            start = done_so_far + 1
+            end = done_so_far + len(batch)
             spinner = ProgressSpinner(
                 "Simulator",
                 f"tasks {start}-{end}/{total}",
@@ -983,12 +1125,34 @@ class PlanningSwarm:
                 )
             except Exception:
                 spinner.stop("failed")
+                # Save progress before re-raising
+                if all_verdicts:
+                    self.state.data["simulation_verdicts"] = [
+                        v.model_dump() for v in all_verdicts
+                    ]
+                    self.state.save()
+                    print(
+                        f"   Checkpointed {len(all_verdicts)} "
+                        f"verdicts before failure"
+                    )
                 raise
+
             batch_ready = sum(
                 1 for v in result if v.readiness == Readiness.READY
             )
             spinner.stop(f"{batch_ready}/{len(result)} ready")
             all_verdicts.extend(result)
+            done_so_far += len(batch)
+
+            # Checkpoint after each batch
+            self.state.data["simulation_verdicts"] = [
+                v.model_dump() for v in all_verdicts
+            ]
+            self.state.save()
+
+        # Clear checkpoint now that we're fully done
+        self.state.data.pop("simulation_verdicts", None)
+        self.state.save()
 
         ready = sum(
             1 for v in all_verdicts if v.readiness == Readiness.READY
@@ -1234,8 +1398,11 @@ class PlanningSwarm:
                 print(f"\n   Re-resolving contracts after revisions...")
                 contracts = self.resolve_contracts(tree, contracts)
                 self.state.data["adversary_round"] = i + 1
-                # Clear batch checkpoints for next round
+                # Clear all batch checkpoints for next round
                 self.state.data.pop("adversary_resolutions", None)
+                self.state.data.pop("adversary_findings", None)
+                self.state.data.pop("adversary_batches_done", None)
+                self.state.data.pop("contract_resolutions", None)
                 self.state.save()  # checkpoint within the loop
 
             self.state.mark_complete(
