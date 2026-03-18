@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import Optional
 
 from .artifacts import save_artifact, load_artifact
-from .beads_bridge import write_to_beads
 from .context import assemble_context
+from .graph_builder import build_graph
 from .models import call_model, ModelTier
 from .schemas import (
     Assumption,
@@ -43,7 +43,7 @@ class Step(str, PyEnum):
     SEQUENCE = "sequence"
     SIMULATE = "simulate"
     REFINE = "refine"
-    BEADS = "beads_export"
+    EXPORT = "graph_export"
 
 
 STEP_ORDER = list(Step)
@@ -59,7 +59,7 @@ STEP_LABELS = {
     Step.SEQUENCE: "Sequencer",
     Step.SIMULATE: "Simulator",
     Step.REFINE: "Refinement",
-    Step.BEADS: "Beads Export",
+    Step.EXPORT: "Graph Export",
 }
 
 
@@ -200,7 +200,6 @@ class PlanningSwarm:
         self.plan_dir = project_dir / ".plan"
         self.config = config
         self.plan_dir.mkdir(parents=True, exist_ok=True)
-        (self.plan_dir / "contracts").mkdir(exist_ok=True)
         (self.plan_dir / "tasks").mkdir(exist_ok=True)
         self.state = PipelineState(self.plan_dir / ".state.json")
 
@@ -355,82 +354,69 @@ class PlanningSwarm:
             lines.append(f"**Rationale:** {r.rationale}\n")
         return "\n".join(lines)
 
-    def _render_task(self, task: Task) -> str:
-        """Render a Task as readable markdown."""
-        lines = [f"# Task {task.id}: {task.title}\n"]
-        lines.append(f"**Component:** {task.component}")
-        lines.append(f"**Complexity:** {task.complexity.value}")
-        if task.estimated_tokens:
-            lines.append(f"**Estimated tokens:** {task.estimated_tokens}")
-        lines.append(f"\n## Description\n\n{task.description}\n")
+    def _render_review(
+        self,
+        tree: ComponentTree,
+        contracts: list[InterfaceContract],
+        resolutions: list[Resolution] = None,
+    ) -> str:
+        """Render a consolidated review document for human approval.
 
-        if task.contracts_to_satisfy:
-            lines.append("## Contracts to Satisfy\n")
-            for c in task.contracts_to_satisfy:
-                lines.append(f"- {c}")
-            lines.append("")
+        Combines architecture, contracts, and decisions into a single
+        compact markdown file. This is the ONLY markdown output — everything
+        else is JSON (graph.json + task packets).
+        """
+        lines = ["# Plan Review\n"]
 
-        if task.files_to_create:
-            lines.append("## Files to Create\n")
-            for f in task.files_to_create:
-                lines.append(f"- `{f}`")
-            lines.append("")
-
-        if task.files_to_modify:
-            lines.append("## Files to Modify\n")
-            for f in task.files_to_modify:
-                lines.append(f"- `{f}`")
-            lines.append("")
-
-        if task.context_files:
-            lines.append("## Context Files\n")
-            for f in task.context_files:
-                lines.append(f"- `{f}`")
-            lines.append("")
-
-        lines.append("## Acceptance Criteria\n")
-        for ac in task.acceptance_criteria:
-            lines.append(f"- [ ] {ac}")
+        # -- Architecture section
+        lines.append("## Architecture\n")
+        lines.append(f"{tree.rationale}\n")
+        lines.append("### Components\n")
+        for c in tree.components:
+            deps = f" (depends: {', '.join(c.depends_on)})" if c.depends_on else ""
+            data = f" | owns: {', '.join(c.owns_data)}" if c.owns_data else ""
+            lines.append(f"- **{c.name}** (`{c.id}`): "
+                         f"{c.responsibility}{data}{deps}")
         lines.append("")
 
-        if task.not_in_scope:
-            lines.append("## Not In Scope\n")
-            for n in task.not_in_scope:
-                lines.append(f"- {n}")
+        if tree.data_flows:
+            lines.append("### Data Flows\n")
+            for flow in tree.data_flows:
+                src = flow.get("from", "?")
+                dst = flow.get("to", "?")
+                desc = flow.get("data_description", "")
+                lines.append(f"- {src} -> {dst}: {desc}")
             lines.append("")
 
-        if task.depends_on:
-            lines.append("## Dependencies\n")
-            for d in task.depends_on:
-                lines.append(f"- Task {d}")
+        # -- Contracts section (compact)
+        lines.append("## Contracts\n")
+        for contract in contracts:
+            lines.append(f"### {contract.boundary_id}\n")
+            lines.append(
+                f"{contract.from_component} -> {contract.to_component} "
+                f"({contract.communication_pattern.value})\n"
+            )
+            for fn in contract.functions:
+                name = fn.get("name", "unnamed")
+                params = json.dumps(fn.get("params", {}))
+                returns = json.dumps(fn.get("returns", {}))
+                lines.append(f"- `{name}({params}) -> {returns}`")
+            if contract.error_cases:
+                errors = ", ".join(ec.error_type for ec in contract.error_cases)
+                lines.append(f"- Errors: {errors}")
+            if contract.stub_strategy and contract.stub_strategy.can_stub:
+                lines.append(f"- Stub: {contract.stub_strategy.stub_description}")
             lines.append("")
 
-        return "\n".join(lines)
-
-    def _render_simulation(self, verdicts: list[TaskVerdict]) -> str:
-        """Render simulation report."""
-        lines = ["# Simulation Report\n"]
-
-        ready = [v for v in verdicts if v.readiness == Readiness.READY]
-        needs_work = [
-            v for v in verdicts if v.readiness == Readiness.NEEDS_REFINEMENT
-        ]
-        blocked = [v for v in verdicts if v.readiness == Readiness.BLOCKED]
-
-        lines.append(f"- **Ready:** {len(ready)}")
-        lines.append(f"- **Needs refinement:** {len(needs_work)}")
-        lines.append(f"- **Blocked:** {len(blocked)}")
-        lines.append("")
-
-        for v in verdicts:
-            status = v.readiness.value.upper()
-            lines.append(f"## Task {v.task_id} [{status}]\n")
-            if v.gaps:
-                lines.append("**Gaps:**")
-                for g in v.gaps:
-                    lines.append(f"- {g}")
-            if v.refinement_target:
-                lines.append(f"\n**Refinement target:** {v.refinement_target}")
+        # -- Decisions section
+        if resolutions:
+            lines.append("## Decisions\n")
+            for r in resolutions:
+                action_label = r.action.upper()
+                lines.append(
+                    f"- **#{r.finding_index} [{action_label}]**: "
+                    f"{r.changes_made} ({r.rationale})"
+                )
             lines.append("")
 
         return "\n".join(lines)
@@ -664,10 +650,6 @@ class PlanningSwarm:
         finally:
             review_spinner.stop("Self-review complete")
 
-        save_artifact(
-            self.plan_dir / "architecture.md",
-            self._render_architecture(reviewed),
-        )
         return reviewed
 
     # -- Step 2: Write Contracts ----------------------------------------------
@@ -694,14 +676,6 @@ class PlanningSwarm:
             spinner.stop("failed")
             raise
         spinner.stop(f"{len(result)} draft contracts")
-
-        for contract in result:
-            save_artifact(
-                self.plan_dir
-                / "contracts"
-                / f"{contract.boundary_id}.md",
-                self._render_contract(contract),
-            )
         return result
 
     # -- Step 3: Resolve Contracts --------------------------------------------
@@ -795,14 +769,6 @@ class PlanningSwarm:
         self.state.data.pop("contract_resolutions", None)
         self.state.save()
 
-        # Overwrite drafts with resolved versions
-        for contract in resolved:
-            save_artifact(
-                self.plan_dir
-                / "contracts"
-                / f"{contract.boundary_id}.md",
-                self._render_contract(contract),
-            )
         print(f"   All {len(resolved)}/{total} contracts resolved")
         return resolved
 
@@ -1001,12 +967,6 @@ class PlanningSwarm:
             ]
             self.state.save()
 
-        # Save final decisions document
-        save_artifact(
-            self.plan_dir / "decisions.md",
-            self._render_decisions(all_resolutions),
-        )
-
         total_revised = sum(
             1 for r in all_resolutions if r.action == "revise"
         )
@@ -1048,13 +1008,6 @@ class PlanningSwarm:
             spinner.stop("failed")
             raise
         spinner.stop(f"{len(result)} tasks generated")
-
-        for task in result:
-            slug = task.title.lower().replace(" ", "-")
-            save_artifact(
-                self.plan_dir / "tasks" / f"{task.id}-{slug}.md",
-                self._render_task(task),
-            )
         return result
 
     # -- Step 7: Simulate Readiness -------------------------------------------
@@ -1158,11 +1111,6 @@ class PlanningSwarm:
             1 for v in all_verdicts if v.readiness == Readiness.READY
         )
         print(f"   All {ready}/{total} tasks ready")
-
-        save_artifact(
-            self.plan_dir / "simulation-report.md",
-            self._render_simulation(all_verdicts),
-        )
         return all_verdicts
 
     # -- Serialization helpers ------------------------------------------------
@@ -1210,6 +1158,13 @@ class PlanningSwarm:
             data = self.state.get_output(step)
             if data and "tasks" in data:
                 return [Task(**t) for t in data["tasks"]]
+        return []
+
+    def _load_resolutions(self) -> list[Resolution]:
+        """Load resolutions from the adversary step output."""
+        data = self.state.get_output(Step.ADVERSARY)
+        if data and "resolutions" in data:
+            return [Resolution(**r) for r in data["resolutions"]]
         return []
 
     # -- Full Orchestration ---------------------------------------------------
@@ -1419,10 +1374,16 @@ class PlanningSwarm:
         if not self.state.is_complete(Step.HUMAN_REVIEW):
             header(Step.HUMAN_REVIEW)
             self.state.mark_started(Step.HUMAN_REVIEW)
+
+            # Write the consolidated review document
+            resolutions = self._load_resolutions()
+            save_artifact(
+                self.plan_dir / "review.md",
+                self._render_review(tree, contracts, resolutions),
+            )
+
             print(f"\n   Review the plan in: {self.plan_dir}/")
-            print(f"   - architecture.md     -- component tree")
-            print(f"   - contracts/          -- interface contracts")
-            print(f"   - decisions.md        -- rationale")
+            print(f"   - review.md           -- architecture + contracts + decisions")
             print(f"\n   Then run:")
             print(f"     swarm approve         -> continue pipeline")
             print(f"     swarm rerun adversary -> re-run adversary loop")
@@ -1494,13 +1455,14 @@ class PlanningSwarm:
         elif not needs_work:
             self.state.mark_complete(Step.REFINE, log_msg="Not needed")
 
-        # -- BEADS EXPORT -----------------------------------------------------
-        if not self.state.is_complete(Step.BEADS):
-            header(Step.BEADS)
-            self.state.mark_started(Step.BEADS)
-            write_to_beads(tasks, verdicts, self.project_dir)
+        # -- GRAPH EXPORT -----------------------------------------------------
+        if not self.state.is_complete(Step.EXPORT):
+            header(Step.EXPORT)
+            self.state.mark_started(Step.EXPORT)
+            build_graph(brief, tree, tasks, contracts, verdicts,
+                        self.project_dir)
             self.state.mark_complete(
-                Step.BEADS, log_msg=f"{len(tasks)} tasks exported"
+                Step.EXPORT, log_msg=f"{len(tasks)} tasks exported"
             )
 
         # -- DONE -------------------------------------------------------------
@@ -1511,8 +1473,11 @@ class PlanningSwarm:
         print(f"\n{'=' * 50}")
         print(f"  Planning complete ({elapsed:.0f}s)")
         print(f"{'=' * 50}")
-        print(f"  Plan:    {self.plan_dir}/")
+        print(f"  Graph:   {self.plan_dir}/graph.json")
         print(f"  Tasks:   {len(tasks)} total, {ready} ready")
-        print(f"  Next:    bd ready --json")
+        print(f"  Packets: {self.plan_dir}/tasks/*.json")
+        print(f"\n  Commands:")
+        print(f"    swarm status       -> view task graph")
+        print(f"    swarm done <id>    -> mark task complete")
         print()
         self.state.print_status()

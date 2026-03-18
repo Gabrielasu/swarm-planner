@@ -13,7 +13,18 @@ from .config import (
     require_auth,
     save_config,
 )
+from .graph_builder import (
+    add_discovery,
+    get_ready_tasks,
+    get_task_packet,
+    get_unresolved_discoveries,
+    load_graph,
+    mark_task_done,
+    mark_task_in_progress,
+    resolve_discovery,
+)
 from .runner import PlanningSwarm, PipelineState, Step, STEP_LABELS, STEP_ORDER
+from .schemas import Discovery, DiscoveryType, Severity
 
 API_KEY_URL = "https://console.anthropic.com/settings/keys"
 
@@ -222,8 +233,8 @@ def plan(brief_file, codebase, max_rounds, inline, resume):
 def approve():
     """Approve the plan and continue the pipeline.
 
-    Run this after reviewing .plan/architecture.md, .plan/contracts/,
-    and .plan/decisions.md during the human review checkpoint.
+    Run this after reviewing .plan/review.md during the human review
+    checkpoint.
     """
     state_file = Path.cwd() / ".plan" / ".state.json"
     if not state_file.exists():
@@ -254,7 +265,7 @@ def rerun(step_name):
 
     Valid steps: interview, codebase_analysis, decompose,
     write_contracts, resolve_contracts, adversary, human_review,
-    sequence, simulate, refine, beads_export
+    sequence, simulate, refine, graph_export
 
     Example:
 
@@ -279,8 +290,16 @@ def rerun(step_name):
 
 
 @cli.command()
-def status():
-    """Show current pipeline status."""
+@click.option("--graph", is_flag=True, help="Show task graph status instead of pipeline status")
+def status(graph):
+    """Show current pipeline and task graph status.
+
+    Examples:
+
+        swarm status          # pipeline steps + task graph summary
+
+        swarm status --graph  # detailed task graph view
+    """
     state_file = Path.cwd() / ".plan" / ".state.json"
     if not state_file.exists():
         click.echo("No plan found. Run 'swarm plan' first.")
@@ -291,13 +310,79 @@ def status():
     cfg = load_config()
     method = cfg.get("auth_method", "")
 
-    click.echo("\n  Planning Swarm -- Pipeline Status\n")
+    click.echo("\n  Planning Swarm -- Status\n")
     if method == "opencode":
         click.echo("  Auth: OpenCode (Claude subscription)\n")
     elif method == "api_key":
         click.echo("  Auth: API key\n")
 
+    # Always show pipeline status
     state.print_status()
+
+    # Show task graph if available
+    graph_data = load_graph(Path.cwd())
+    if graph_data:
+        meta = graph_data["meta"]
+        click.echo(f"\n  Task Graph (v{meta['version']}):")
+        click.echo(
+            f"    {meta['total_tasks']} total | "
+            f"{meta['done']} done | "
+            f"{meta['ready']} ready | "
+            f"{meta['blocked']} blocked"
+        )
+
+        # Show unresolved discoveries
+        unresolved = [
+            d for d in graph_data.get("discoveries", [])
+            if not d.get("resolved", False)
+        ]
+        if unresolved:
+            click.echo(f"\n    Unresolved discoveries: {len(unresolved)}")
+            for d in unresolved:
+                click.echo(
+                    f"      [{d['severity'].upper()}] {d['description']} "
+                    f"(found during {d['found_during']})"
+                )
+
+        if graph or True:  # Always show ready tasks summary
+            ready_tasks = [
+                t for t in graph_data["tasks"]
+                if t["status"] == "ready"
+            ]
+            if ready_tasks:
+                click.echo(f"\n    Ready tasks:")
+                for t in ready_tasks:
+                    tokens = f" ~{t['tokens']}tok" if t.get("tokens") else ""
+                    click.echo(
+                        f"      {t['id']}  {t['title']}"
+                        f"  [{t['complexity']}]{tokens}"
+                    )
+
+        if graph:
+            # Full task listing
+            click.echo(f"\n    All tasks:")
+            for t in graph_data["tasks"]:
+                status_icon = {
+                    "done": "[done]",
+                    "ready": "[READY]",
+                    "in_progress": "[....]",
+                    "pending": "[    ]",
+                    "invalidated": "[!!!!]",
+                    "needs_update": "[upd ]",
+                }.get(t["status"], f"[{t['status']}]")
+                deps = f" <- {','.join(t['depends'])}" if t["depends"] else ""
+                click.echo(
+                    f"      {status_icon} {t['id']}  {t['title']}"
+                    f"  ({t['component']}){deps}"
+                )
+
+    else:
+        rp = state.get_resume_point()
+        if rp:
+            click.echo(
+                f"\n  Next: swarm plan --resume  "
+                f"(continues from {STEP_LABELS[rp]})"
+            )
 
     if state.data.get("log"):
         click.echo("\n  Recent activity:")
@@ -307,14 +392,6 @@ def status():
                 f"    {t}  {entry['step']}: {entry['message']}"
             )
 
-    rp = state.get_resume_point()
-    if rp:
-        click.echo(
-            f"\n  Next: swarm plan --resume  "
-            f"(continues from {STEP_LABELS[rp]})"
-        )
-    else:
-        click.echo("\n  All steps complete.")
     click.echo()
 
 
@@ -338,6 +415,14 @@ def log():
         click.echo(f"  {t}  {label}")
         click.echo(f"    {entry['message']}")
 
+    # Also show graph changelog if available
+    graph_data = load_graph(Path.cwd())
+    if graph_data and graph_data["meta"].get("changelog"):
+        click.echo("\n  Graph changelog:")
+        for entry in graph_data["meta"]["changelog"]:
+            click.echo(f"  v{entry['v']}  {entry['action']}")
+            click.echo(f"    {entry['detail']}")
+
 
 @cli.command()
 def reset():
@@ -351,6 +436,253 @@ def reset():
         click.echo("   Run 'swarm plan' to start fresh.")
     else:
         click.echo("   No state to reset.")
+
+
+# ---------------------------------------------------------------------------
+# Task graph management commands
+# ---------------------------------------------------------------------------
+
+
+@cli.command()
+@click.argument("task_id")
+def done(task_id):
+    """Mark a task as completed and update the graph.
+
+    Automatically recomputes which blocked tasks become ready.
+
+    Examples:
+
+        swarm done 001
+
+        swarm done 003
+    """
+    try:
+        graph = mark_task_done(Path.cwd(), task_id)
+    except (FileNotFoundError, ValueError) as e:
+        click.echo(f"   Error: {e}")
+        return
+
+    meta = graph["meta"]
+    click.echo(f"   Task {task_id} marked as done.")
+    click.echo(
+        f"   Graph: {meta['done']} done, "
+        f"{meta['ready']} ready, "
+        f"{meta['blocked']} blocked"
+    )
+
+    # Show newly ready tasks
+    newly_ready = [
+        t for t in graph["tasks"]
+        if t["status"] == "ready"
+    ]
+    if newly_ready:
+        click.echo(f"\n   Ready tasks:")
+        for t in newly_ready:
+            click.echo(f"     {t['id']}  {t['title']}")
+
+
+@cli.command()
+@click.argument("task_id")
+def start(task_id):
+    """Mark a task as in-progress.
+
+    Example:
+
+        swarm start 002
+    """
+    try:
+        graph = mark_task_in_progress(Path.cwd(), task_id)
+    except (FileNotFoundError, ValueError) as e:
+        click.echo(f"   Error: {e}")
+        return
+
+    click.echo(f"   Task {task_id} marked as in-progress.")
+
+    # Show the task packet path
+    click.echo(f"   Packet: .plan/tasks/{task_id}.json")
+
+
+@cli.command()
+@click.argument("task_id")
+def show(task_id):
+    """Show a task's full prompt packet.
+
+    Displays the self-contained prompt packet that a coding agent
+    would receive for this task.
+
+    Example:
+
+        swarm show 002
+    """
+    import json
+
+    packet = get_task_packet(Path.cwd(), task_id)
+    if packet is None:
+        click.echo(f"   Task {task_id} not found.")
+        return
+
+    click.echo(json.dumps(packet, indent=2))
+
+
+@cli.command()
+@click.argument("task_id")
+@click.argument("description")
+@click.option(
+    "--type", "-t", "disc_type",
+    type=click.Choice([dt.value for dt in DiscoveryType]),
+    default=DiscoveryType.SCOPE_CHANGE.value,
+    help="Type of discovery",
+)
+@click.option(
+    "--affects", "-a", multiple=True,
+    help="Task IDs affected by this discovery (can specify multiple)",
+)
+@click.option(
+    "--severity", "-s",
+    type=click.Choice([s.value for s in Severity]),
+    default=Severity.HIGH.value,
+    help="Severity of the discovery",
+)
+def discover(task_id, description, disc_type, affects, severity):
+    """Report a discovery made during task implementation.
+
+    When a coding agent finds something during implementation that
+    affects the plan, use this command to record it. Affected tasks
+    will be flagged for review.
+
+    Examples:
+
+        swarm discover 003 "auth-to-api needs revokeToken" -t missing_contract_fn -a 002
+
+        swarm discover 005 "database schema needs migration step" -t task_split_needed -a 004
+    """
+    disc = Discovery(
+        found_during=task_id,
+        type=DiscoveryType(disc_type),
+        description=description,
+        affects=list(affects) if affects else [],
+        severity=Severity(severity),
+    )
+
+    try:
+        graph = add_discovery(Path.cwd(), disc)
+    except FileNotFoundError as e:
+        click.echo(f"   Error: {e}")
+        return
+
+    unresolved = [
+        d for d in graph["discoveries"]
+        if not d.get("resolved", False)
+    ]
+    click.echo(f"   Discovery recorded.")
+    click.echo(f"   Unresolved discoveries: {len(unresolved)}")
+
+    if disc.affects:
+        click.echo(f"   Affected tasks flagged for update: {', '.join(disc.affects)}")
+
+
+@cli.command()
+@click.argument("index", type=int)
+@click.argument("resolution")
+def resolve(index, resolution):
+    """Resolve a discovery and unblock affected tasks.
+
+    INDEX is the discovery number (shown by swarm status).
+    RESOLUTION is a description of how it was resolved.
+
+    After resolving, affected tasks move back to pending/ready
+    based on their dependency state.
+
+    Examples:
+
+        swarm resolve 0 "Added revokeToken to auth contract and updated task packet"
+
+        swarm resolve 1 "Split task 004 into 004a (schema) and 004b (migrations)"
+    """
+    try:
+        graph = resolve_discovery(Path.cwd(), index, resolution)
+    except (FileNotFoundError, IndexError, ValueError) as e:
+        click.echo(f"   Error: {e}")
+        return
+
+    meta = graph["meta"]
+    click.echo(f"   Discovery #{index} resolved.")
+    click.echo(
+        f"   Graph: {meta['done']} done, "
+        f"{meta['ready']} ready, "
+        f"{meta['blocked']} blocked"
+    )
+
+    unresolved = [
+        d for d in graph["discoveries"]
+        if not d.get("resolved", False)
+    ]
+    if unresolved:
+        click.echo(f"   Remaining unresolved: {len(unresolved)}")
+    else:
+        click.echo(f"   All discoveries resolved.")
+
+
+@cli.command()
+@click.option("--port", "-p", default=8420, type=int, help="Port to serve on")
+@click.option("--no-open", is_flag=True, help="Don't auto-open the browser")
+def dashboard(port, no_open):
+    """Launch the real-time dashboard to track swarm progress.
+
+    Opens a web UI showing pipeline steps, task graph, discoveries,
+    and activity -- all updating in real time as files change.
+
+    Examples:
+
+        swarm dashboard              # start on port 8420
+
+        swarm dashboard --port 9000  # custom port
+
+        swarm dashboard --no-open    # don't open browser
+    """
+    from .dashboard import run_dashboard
+
+    run_dashboard(
+        project_dir=Path.cwd(),
+        port=port,
+        open_browser=not no_open,
+    )
+
+
+@cli.command()
+def ready():
+    """List all tasks that are ready to be worked on.
+
+    Shows tasks whose dependencies are all complete and that
+    haven't been invalidated.
+    """
+    tasks = get_ready_tasks(Path.cwd())
+    if not tasks:
+        click.echo("   No ready tasks.")
+
+        graph = load_graph(Path.cwd())
+        if graph:
+            meta = graph["meta"]
+            if meta["done"] == meta["total_tasks"]:
+                click.echo("   All tasks complete!")
+            else:
+                click.echo(
+                    f"   {meta['done']}/{meta['total_tasks']} done. "
+                    f"Remaining tasks are blocked on dependencies."
+                )
+        return
+
+    click.echo(f"\n   Ready tasks ({len(tasks)}):\n")
+    for t in tasks:
+        tokens = f" ~{t['tokens']}tok" if t.get("tokens") else ""
+        deps = f" (after: {', '.join(t['depends'])})" if t["depends"] else ""
+        click.echo(
+            f"   {t['id']}  {t['title']}  "
+            f"[{t['complexity']}]{tokens}{deps}"
+        )
+
+    click.echo(f"\n   Run: swarm show <id>   to see full task packet")
+    click.echo(f"        swarm start <id>  to mark as in-progress")
 
 
 if __name__ == "__main__":
