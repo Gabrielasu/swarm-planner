@@ -174,3 +174,95 @@ class TaskVerdict(BaseModel):
     readiness: Readiness
     gaps: list[str]  # Specific missing information
     refinement_target: Optional[str] = None  # Which contract/component needs work
+
+
+# -- Stateful Task Graph (Output Format) -------------------------------------
+
+
+class TaskStatus(str, Enum):
+    PENDING = "pending"            # Dependencies not yet met
+    READY = "ready"                # All deps done, can be picked up
+    IN_PROGRESS = "in_progress"    # Agent is working on it
+    DONE = "done"                  # Implementation complete
+    INVALIDATED = "invalidated"    # Was done, but upstream change broke it
+    NEEDS_UPDATE = "needs_update"  # Planner flagged for revision
+
+
+class DiscoveryType(str, Enum):
+    MISSING_CONTRACT_FN = "missing_contract_fn"
+    TASK_SPLIT_NEEDED = "task_split_needed"
+    DEPENDENCY_MISSING = "dependency_missing"
+    SCOPE_CHANGE = "scope_change"
+    BLOCKER = "blocker"
+
+
+class Discovery(BaseModel):
+    found_during: str           # Task ID where this was discovered
+    type: DiscoveryType
+    description: str            # What was found
+    affects: list[str]          # Task IDs affected
+    severity: Severity          # Reuses existing Severity enum
+    resolved: bool = False
+    resolution: Optional[str] = None
+
+
+# -- Inline Contract (compact, for prompt packets) ---------------------------
+
+
+class InlineContractFn(BaseModel):
+    name: str
+    params: dict                # {param_name: type_string}
+    returns: dict               # {field_name: type_string}
+    errors: list[str]           # Error type names only
+
+
+class InlineContract(BaseModel):
+    boundary: str               # boundary_id
+    pattern: str                # Communication pattern (short form)
+    fns: list[InlineContractFn]
+    error_shape: dict           # Common error response shape
+    stub: str                   # Stub description for parallel dev
+
+
+# -- Prompt Packet (self-contained task for coding agents) -------------------
+
+
+class PromptPacket(BaseModel):
+    id: str
+    title: str
+    v: int = 1                  # Version — increments on update
+    instruction: str            # One-sentence: what to build
+    component: str
+    complexity: str             # Complexity value as string
+    create: list[str]           # Files to create
+    modify: list[str]           # Files to modify
+    context: list[str]          # Files to read for context
+    contracts: list[InlineContract]  # Inlined contract data
+    done_when: list[str]        # Acceptance criteria
+    not_this: list[str]         # Explicit exclusions
+    depends: list[str]          # Task IDs this depends on
+    unlocks: list[str]          # Task IDs this enables
+
+
+# -- Graph Task Entry (compact, for graph.json index) ------------------------
+
+
+class GraphTask(BaseModel):
+    id: str
+    title: str
+    component: str
+    complexity: str             # Complexity value as string
+    status: TaskStatus
+    depends: list[str]          # Task IDs
+    tokens: Optional[int] = None
+
+
+# -- Changelog Entry (tracks graph mutations) --------------------------------
+
+
+class ChangelogEntry(BaseModel):
+    v: int                      # Graph version at time of change
+    action: str                 # plan_created, task_completed, etc.
+    detail: str                 # Human-readable description
+    affected: list[str] = []    # Task IDs affected
+    ts: str                     # ISO timestamp

@@ -24,7 +24,7 @@ planning-swarm/
 │   ├── models.py             # Model routing (which agent gets which model)
 │   ├── context.py            # Context assembly for each agent
 │   ├── artifacts.py          # Read/write/validate .plan/ artifacts
-│   ├── beads_bridge.py       # Write task graph to Beads
+│   ├── graph_builder.py      # Build stateful task graph (graph.json + prompt packets)
 │   └── schemas.py            # Pydantic models for all artifact types
 ├── prompts/
 │   ├── 00_interviewer.md
@@ -37,12 +37,13 @@ planning-swarm/
 │   ├── 06_sequencer.md
 │   └── 07_simulator.md
 ├── .plan/                    # Generated output (gitignored until exported)
+│   ├── .state.json           # Pipeline state (enables resume/rerun)
 │   ├── brief.md              # Structured brief (Interviewer output)
-│   ├── architecture.md
-│   ├── contracts/
-│   ├── decisions.md
-│   ├── tasks/
-│   └── simulation-report.md
+│   ├── review.md             # Consolidated review doc (architecture + contracts + decisions)
+│   ├── graph.json            # Stateful task DAG (THE primary output)
+│   └── tasks/                # Self-contained prompt packets (one per task)
+│       ├── 001.json
+│       └── 002.json
 ├── pyproject.toml
 └── README.md
 ```
@@ -246,7 +247,7 @@ from .models import call_model, ModelTier
 from .context import assemble_context
 from .artifacts import save_artifact, load_artifact
 from .schemas import *
-from .beads_bridge import write_to_beads
+from .graph_builder import build_graph
 
 
 # ── Pipeline Steps ───────────────────────────────────────────────
@@ -262,7 +263,7 @@ class Step(str, PyEnum):
     SEQUENCE = "sequence"
     SIMULATE = "simulate"
     REFINE = "refine"
-    BEADS = "beads_export"
+    EXPORT = "graph_export"
 
 STEP_ORDER = list(Step)
 
@@ -277,7 +278,7 @@ STEP_LABELS = {
     Step.SEQUENCE:          "📋 Sequencer",
     Step.SIMULATE:          "🧪 Simulator",
     Step.REFINE:            "🔄 Refinement",
-    Step.BEADS:             "📦 Beads Export",
+    Step.EXPORT:            "📦 Graph Export",
 }
 
 
@@ -964,13 +965,13 @@ class PlanningSwarm:
         elif not needs_work:
             self.state.mark_complete(Step.REFINE, log_msg="Not needed")
 
-        # ── BEADS EXPORT ──────────────────────────────────────
-        if not self.state.is_complete(Step.BEADS):
-            header(Step.BEADS)
-            self.state.mark_started(Step.BEADS)
-            write_to_beads(tasks, verdicts, self.project_dir)
+        # ── GRAPH EXPORT ──────────────────────────────────────
+        if not self.state.is_complete(Step.EXPORT):
+            header(Step.EXPORT)
+            self.state.mark_started(Step.EXPORT)
+            build_graph(brief, tree, tasks, contracts, verdicts, self.project_dir)
             self.state.mark_complete(
-                Step.BEADS, log_msg=f"{len(tasks)} tasks exported")
+                Step.EXPORT, log_msg=f"{len(tasks)} tasks exported")
 
         # ── DONE ──────────────────────────────────────────────
         elapsed = time.time() - start_time
@@ -1782,7 +1783,7 @@ def rerun(step_name):
     
     Valid steps: interview, codebase_analysis, decompose, 
     write_contracts, resolve_contracts, adversary, human_review,
-    sequence, simulate, refine, beads_export
+    sequence, simulate, refine, graph_export
     
     Example:
         swarm rerun adversary    # re-run adversary + everything after
@@ -1918,7 +1919,7 @@ major improvement over existing planning tools.
 7. `06_sequencer.md` and `07_simulator.md` — Add task generation and 
    readiness checking. Now the full pipeline runs.
 
-8. `beads_bridge.py` — Write the Beads integration so tasks land in 
+8. `graph_builder.py` — Write the graph builder so tasks land in 
    `bd` with dependency edges.
 
 9. `cli.py` — Wrap everything in a proper CLI with file input, inline 
