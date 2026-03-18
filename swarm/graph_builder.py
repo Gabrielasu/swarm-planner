@@ -160,6 +160,7 @@ def build_graph(
     done_tasks: set[str] = set()  # Fresh plan — nothing done yet
 
     # Build components summary for graph.json
+    # Keyed by comp.name (matches task.component field) with ID as a field
     components = {}
     for comp in tree.components:
         # Find interfaces this component participates in
@@ -167,7 +168,9 @@ def build_graph(
         for c in contracts:
             if c.from_component == comp.id or c.to_component == comp.id:
                 interfaces.add(c.boundary_id)
-        components[comp.id] = {
+        components[comp.name] = {
+            "id": comp.id,
+            "responsibility": comp.responsibility,
             "owns": comp.owns_data,
             "interfaces": sorted(interfaces),
         }

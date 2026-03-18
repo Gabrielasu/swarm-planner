@@ -21,6 +21,7 @@ from .graph_builder import (
     load_graph,
     mark_task_done,
     mark_task_in_progress,
+    resolve_discovery,
 )
 from .runner import PlanningSwarm, PipelineState, Step, STEP_LABELS, STEP_ORDER
 from .schemas import Discovery, DiscoveryType, Severity
@@ -578,6 +579,74 @@ def discover(task_id, description, disc_type, affects, severity):
 
     if disc.affects:
         click.echo(f"   Affected tasks flagged for update: {', '.join(disc.affects)}")
+
+
+@cli.command()
+@click.argument("index", type=int)
+@click.argument("resolution")
+def resolve(index, resolution):
+    """Resolve a discovery and unblock affected tasks.
+
+    INDEX is the discovery number (shown by swarm status).
+    RESOLUTION is a description of how it was resolved.
+
+    After resolving, affected tasks move back to pending/ready
+    based on their dependency state.
+
+    Examples:
+
+        swarm resolve 0 "Added revokeToken to auth contract and updated task packet"
+
+        swarm resolve 1 "Split task 004 into 004a (schema) and 004b (migrations)"
+    """
+    try:
+        graph = resolve_discovery(Path.cwd(), index, resolution)
+    except (FileNotFoundError, IndexError, ValueError) as e:
+        click.echo(f"   Error: {e}")
+        return
+
+    meta = graph["meta"]
+    click.echo(f"   Discovery #{index} resolved.")
+    click.echo(
+        f"   Graph: {meta['done']} done, "
+        f"{meta['ready']} ready, "
+        f"{meta['blocked']} blocked"
+    )
+
+    unresolved = [
+        d for d in graph["discoveries"]
+        if not d.get("resolved", False)
+    ]
+    if unresolved:
+        click.echo(f"   Remaining unresolved: {len(unresolved)}")
+    else:
+        click.echo(f"   All discoveries resolved.")
+
+
+@cli.command()
+@click.option("--port", "-p", default=8420, type=int, help="Port to serve on")
+@click.option("--no-open", is_flag=True, help="Don't auto-open the browser")
+def dashboard(port, no_open):
+    """Launch the real-time dashboard to track swarm progress.
+
+    Opens a web UI showing pipeline steps, task graph, discoveries,
+    and activity -- all updating in real time as files change.
+
+    Examples:
+
+        swarm dashboard              # start on port 8420
+
+        swarm dashboard --port 9000  # custom port
+
+        swarm dashboard --no-open    # don't open browser
+    """
+    from .dashboard import run_dashboard
+
+    run_dashboard(
+        project_dir=Path.cwd(),
+        port=port,
+        open_browser=not no_open,
+    )
 
 
 @cli.command()

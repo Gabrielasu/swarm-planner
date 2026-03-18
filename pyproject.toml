@@ -12,6 +12,9 @@ dependencies = [
     "click>=8.1",
     "pydantic>=2.0",
     "anthropic>=0.39",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "websockets>=12.0",
 ]
 
 [project.scripts]
@@ -21,4 +24,4 @@ swarm = "swarm.cli:cli"
 include = ["swarm*"]
 
 [tool.setuptools.package-data]
-swarm = ["prompts/*.md"]
+swarm = ["prompts/*.md", "static/*.html"]
